@@ -5,9 +5,10 @@
 # eccedict.py -
 #
 # Created by H1DDENADM1N on 2025/01/09
-# Last Modified: 2025/01/09 08:48
+# Last Modified: 2025/01/09 21:48
 #
 # ======================================================================
+import re
 from pathlib import Path
 
 import duckdb
@@ -16,6 +17,13 @@ from loguru import logger
 
 from writemdict.writemdict import MDictWriter
 
+# 支持常见的词性缩写
+POS_PATTERN = re.compile(
+    r"^(a|na|n|un|v|vt|vi|adj|adv|pron|prep|conj|interj|art|num|aux|pl|sing|past|pp|pres|ger|det|modal|part|suf|pref|abbr|coll|phr)\.\s*(.*)"
+)
+# 定义正则表达式匹配中文字符
+CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+
 
 def convert_csv_to_duckdb(csv_file: Path, duckdb_file: Path):
     """
@@ -23,10 +31,10 @@ def convert_csv_to_duckdb(csv_file: Path, duckdb_file: Path):
     """
     if not csv_file.exists():
         logger.error(f"{csv_file} 未找到")
-        raise FileNotFoundError(csv_file)
+        raise FileNotFoundError(f"{csv_file} 未找到")
     if duckdb_file.exists():
         logger.error(f"{duckdb_file} 已存在")
-        raise FileExistsError(duckdb_file)
+        raise FileExistsError(f"{duckdb_file} 已存在")
     # 连接到DuckDB数据库（如果数据库不存在，则会自动创建）
     conn = duckdb.connect(database=str(duckdb_file), read_only=False)
     # 读取CSV文件并导入到DuckDB表中
@@ -43,10 +51,10 @@ def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 
     """
     if not duckdb_file.exists():
         logger.error(f"{duckdb_file} 未找到")
-        raise FileNotFoundError(duckdb_file)
+        raise FileNotFoundError(f"{duckdb_file} 未找到")
     if txt_file.exists():
         logger.error(f"{txt_file} 已存在")
-        raise FileExistsError(txt_file)
+        raise FileExistsError(f"{txt_file} 已存在")
 
     # 连接到 DuckDB 数据库
     conn = duckdb.connect(database=str(duckdb_file), read_only=True)
@@ -93,9 +101,16 @@ def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 
             if translation:
                 translations = translation.split("\\n")
                 for trans in translations:
-                    if ". " in trans:
-                        _, trans_part = trans.split(". ", 1)
+                    # 排除不包含中文的情况
+                    if not CHINESE_PATTERN.search(trans):
+                        continue
+                    # 使用 POS_PATTERN 提取词性和翻译内容
+                    match = POS_PATTERN.match(trans)
+                    if match:
+                        pos_part = match.group(1) + "."  # 词性部分（如 "n."）
+                        trans_part = match.group(2)  # 翻译内容部分
                     else:
+                        pos_part = ""
                         trans_part = trans
                     # 生成中文到英文的条目
                     chinese_soup = generate_html(
@@ -123,6 +138,8 @@ def generate_html(
     """
     生成 HTML 结构
     """
+    global POS_PATTERN
+
     soup = BeautifulSoup(features="html.parser")
     html_tag = soup.new_tag("html")
     soup.append(html_tag)
@@ -190,13 +207,12 @@ def generate_html(
         # 按换行符分割翻译内容
         translations = translation.split("\\n")
         for trans in translations:
-            # 如果翻译内容包含词性（例如 "n.\n材料，物料"）
-            if ". " in trans:
-                # 提取词性和翻译内容
-                pos_part, trans_part = trans.split(". ", 1)
-                pos_part = pos_part + "."  # 补全词性格式（例如 "n."）
+            # 匹配词性和翻译内容
+            match = POS_PATTERN.match(trans)
+            if match:
+                pos_part = match.group(1) + "."  # 词性部分（如 "n."）
+                trans_part = match.group(2)  # 翻译内容部分
             else:
-                # 如果没有词性，则直接使用翻译内容
                 pos_part = ""
                 trans_part = trans
 
@@ -214,7 +230,7 @@ def generate_html(
             span_dcn.string = trans_part
             div_dcb.append(span_dcn)
 
-            # 将翻译条目添加到容器中
+            # 将翻译条目添加到 gdc 容器中
             div_gdc.append(div_dcb)
 
             # 添加换行标签
@@ -386,14 +402,33 @@ def generate_mdx(txt_file: Path, mdx_file: Path):
 
 
 if __name__ == "__main__":
+    logger.info("开始转换...")
+
     csv_file = Path("stardict.csv")
+    if not csv_file.exists():
+        raise FileNotFoundError(f"{duckdb_file} 未找到")
+
     duckdb_file = Path("stardict.ddb")
-    convert_csv_to_duckdb(duckdb_file, csv_file)
+    if not duckdb_file.exists():
+        convert_csv_to_duckdb(csv_file, duckdb_file)
 
     txt_file = Path("stardict.txt")
+    if txt_file.exists():
+        # 删除旧的 TXT 文件
+        txt_file.unlink()
     convert_duckdb_to_txt(duckdb_file, txt_file, buffer_size=1_000_000)
     logger.info(f"TXT 文件已生成：{txt_file}")
 
     mdx_file = Path("concise-enhanced.mdx")
+    if mdx_file.exists():
+        # 删除旧的 MDX 文件
+        mdx_file.unlink()
     generate_mdx(txt_file, mdx_file)
     logger.info(f"MDX 文件已生成：{mdx_file}")
+
+    # goldendict_exe = Path(r"C:\SSS\GoldenDict-ng\goldendict.exe")
+    # if goldendict_exe.exists():
+    #     # 打开 GoldenDict，自动重建索引
+    #     import subprocess
+
+    #     subprocess.run(str(goldendict_exe))
