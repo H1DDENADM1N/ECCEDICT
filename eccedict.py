@@ -59,7 +59,7 @@ def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 
     # 连接到 DuckDB 数据库
     conn = duckdb.connect(database=str(duckdb_file), read_only=True)
     cursor = conn.cursor()
-    query = """SELECT word, phonetic, translation, pos, collins, oxford, tag, bnc, frq, exchange FROM stardict"""
+    query = """SELECT word, phonetic, definition, translation, collins, oxford, tag, bnc, frq, exchange FROM stardict"""
     cursor.execute(query)
 
     # 一次性读取所有数据
@@ -72,8 +72,8 @@ def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 
             (
                 word,
                 phonetic,
+                definition,
                 translation,
-                pos,
                 collins,
                 oxford,
                 tag,
@@ -86,8 +86,8 @@ def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 
             soup = generate_html(
                 word,
                 phonetic,
+                definition,
                 translation,
-                pos,
                 collins,
                 oxford,
                 tag,
@@ -114,7 +114,7 @@ def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 
                         trans_part = trans
                     # 生成中文到英文的条目
                     chinese_soup = generate_html(
-                        trans_part, "", word, "", "", "", "", "", "", ""
+                        trans_part, "", definition, word, "", "", "", "", "", ""
                     )
                     buffer.append(str(chinese_soup) + "\n")
 
@@ -133,7 +133,16 @@ def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 
 
 
 def generate_html(
-    word, phonetic, translation, pos, collins, oxford, tag, bnc, frq, exchange
+    word,
+    phonetic,
+    definition,
+    translation,
+    collins,
+    oxford,
+    tag,
+    bnc,
+    frq,
+    exchange,
 ):
     """
     生成 HTML 结构
@@ -200,6 +209,7 @@ def generate_html(
                 div_git.append(span_col)
 
     # gdc(dcb dcb ...)  translation
+    # dcb(pos dcn) / dcb(dnt dne)  词性 翻译 / [网络] 翻译
     if translation:
         div_gdc = soup.new_tag("div", **{"class": "gdc"})
         div_ctn.append(div_gdc)
@@ -219,16 +229,25 @@ def generate_html(
             # 创建翻译条目的 HTML 结构
             div_dcb = soup.new_tag("span", **{"class": "dcb"})
 
-            # 如果有词性，添加词性部分
-            if pos_part:
-                span_pos = soup.new_tag("span", **{"class": "pos"})
-                span_pos.string = pos_part
-                div_dcb.append(span_pos)
+            # 匹配 dcb(dnt dne)  [网络] 翻译
+            if trans_part.startswith("[网络]"):
+                span_dnt = soup.new_tag("span", **{"class": "dnt"})
+                span_dnt.string = "[网络]"
+                div_dcb.append(span_dnt)
+                span_dne = soup.new_tag("span", **{"class": "dne"})
+                span_dne.string = trans_part.lstrip("[网络]")
+                div_dcb.append(span_dne)
+            else:
+                # 如果有词性，添加词性部分
+                if pos_part:
+                    span_pos = soup.new_tag("span", **{"class": "pos"})
+                    span_pos.string = pos_part
+                    div_dcb.append(span_pos)
 
-            # 添加翻译内容部分
-            span_dcn = soup.new_tag("span", **{"class": "dcn"})
-            span_dcn.string = trans_part
-            div_dcb.append(span_dcn)
+                # 添加翻译内容部分
+                span_dcn = soup.new_tag("span", **{"class": "dcn"})
+                span_dcn.string = trans_part
+                div_dcb.append(span_dcn)
 
             # 将翻译条目添加到 gdc 容器中
             div_gdc.append(div_dcb)
@@ -236,6 +255,31 @@ def generate_html(
             # 添加换行标签
             br_tag = soup.new_tag("br")
             div_gdc.append(br_tag)
+    else:
+        if definition:
+            # 没有中文翻译内容，但有英文定义，则生成英文到英文的条目
+            # gcd(dcb dcb ...)  definition
+            # dcb(dcn) / dcb(deq)
+            div_gdc = soup.new_tag("div", **{"class": "gdc"})
+            div_ctn.append(div_gdc)
+            definitions = definition.split("\\n")
+            for defi in definitions:
+                # 创建翻译条目的 HTML 结构
+                div_dcb = soup.new_tag("span", **{"class": "dcb"})
+                if defi.startswith(">"):
+                    span_deq = soup.new_tag("span", **{"class": "deq"})
+                    span_deq.string = defi
+                    div_dcb.append(span_deq)
+                else:
+                    span_dcn = soup.new_tag("span", **{"class": "dcn"})
+                    span_dcn.string = defi
+                    div_dcb.append(span_dcn)
+                # 将翻译条目添加到 gdc 容器中
+                div_gdc.append(div_dcb)
+
+                # 添加换行标签
+                br_tag = soup.new_tag("br")
+                div_gdc.append(br_tag)
 
     # gfm()  exchange
     if exchange:
