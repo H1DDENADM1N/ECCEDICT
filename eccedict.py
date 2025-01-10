@@ -42,6 +42,97 @@ def convert_csv_to_duckdb(csv_file: Path, duckdb_file: Path):
     conn.close()
 
 
+def generate_splitedtranslation_column(duckdb_file: Path, buffer_size: int = 1000):
+    """
+    生成拆分后的翻译列，支持分批处理以减少 I/O 读写。
+    """
+    if not duckdb_file.exists():
+        logger.error(f"{duckdb_file} 未找到")
+        raise FileNotFoundError(f"{duckdb_file} 未找到")
+
+    # 连接到 DuckDB 数据库
+    conn = duckdb.connect(str(duckdb_file))
+
+    # 删除 splitedtranslation 列（如果存在）
+    conn.execute("""
+        ALTER TABLE stardict
+        DROP COLUMN IF EXISTS splitedtranslation
+    """)
+    conn.commit()
+
+    # 创建 splitedtranslation 列
+    conn.execute("""
+        ALTER TABLE stardict
+        ADD COLUMN IF NOT EXISTS splitedtranslation TEXT
+    """)
+    conn.commit()
+
+    # 获取总行数
+    total_rows = conn.execute("SELECT COUNT(*) FROM stardict").fetchone()[0]
+    logger.info(f"总行数: {total_rows}")
+
+    # 分批处理
+    for offset in range(0, total_rows, buffer_size):
+        logger.info(f"处理行 {offset} 到 {offset + buffer_size}")
+
+        # 读取当前批次的 translation 列数据
+        result = conn.execute(f"""
+            SELECT translation
+            FROM stardict
+            ORDER BY word
+            LIMIT {buffer_size} OFFSET {offset}
+        """).fetchall()
+
+        # 准备批量更新的数据
+        update_data = []
+        for row in result:
+            translation = row[0]
+            if translation:  # 如果 translation 不为空
+                splited_translation = extract_chinese_words(translation)
+                update_data.append((splited_translation, translation))
+
+        # 批量更新 splitedtranslation 列
+        if update_data:
+            conn.executemany(
+                """
+                UPDATE stardict
+                SET splitedtranslation = ?
+                WHERE translation = ?
+                """,
+                update_data,
+            )
+            conn.commit()
+
+    # 关闭连接
+    conn.close()
+
+
+def extract_chinese_words(text):
+    # 忽略[]和()和〈〉中的内容
+    text = re.sub(
+        r"""\[.*?\]|\(.*?\)|\（.*?\）|\【.*?\】|\〈.*?\〉|同“[^”]*”|同"[^"]*"|同\s[^；]""",
+        "",
+        text,
+    )
+
+    # 提取中文字词，包括连续的三个以上 . 和一个以上 …，并与相邻的中文字符一起匹配
+    # 同时排除以“的”开头并带有后续内容的词
+    chinese_words = re.findall(
+        r"(?<!\的)[\u4e00-\u9fff]+(?:…+|\.{3,})?[\u4e00-\u9fff]*|…+|\.{3,}", text
+    )
+
+    # 使用 dict 的键作为有序集合
+    unique_words = dict.fromkeys(chinese_words)
+
+    # 清除以“的”开头的词
+    unique_words = {word: None for word in unique_words if not word.startswith("的")}
+
+    # 用分号连接结果
+    result = "；".join(unique_words.keys())
+
+    return result
+
+
 def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 1000):
     """
     从 duckdb_file 文件中读取数据并生成指定格式的 HTML 内容，然后将其写入 txt_file 文件，用于生成mdx词典文件
@@ -62,10 +153,15 @@ def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 
     query = """SELECT word, phonetic, translation, pos, collins, oxford, tag, bnc, frq, exchange FROM stardict"""
     cursor.execute(query)
 
+    # 获取总行数
+    total_rows = cursor.execute("SELECT COUNT(*) FROM stardict").fetchone()[0]
+    logger.info(f"总行数: {total_rows}")
+
     # 一次性读取所有数据
     rows = cursor.fetchall()
 
     # 写入 txt_file 文件
+    logger.info(f"开始写入文件: {txt_file}")
     with txt_file.open("w", encoding="utf-8") as f:
         buffer = []  # 用于缓存生成的 HTML 内容
         for row in rows:
@@ -122,12 +218,15 @@ def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 
             if len(buffer) >= buffer_size:
                 f.write("".join(buffer))  # 批量写入
                 buffer.clear()  # 清空缓冲区
+                logger.info(f"已处理 {processed_rows}/{total_rows} 行")
 
         # 写入剩余的缓冲区内容
         if buffer:
             f.write("".join(buffer))
+            logger.info(f"已处理 {processed_rows}/{total_rows} 行")
 
     # 关闭游标和连接
+    logger.info("处理完成，关闭数据库连接")
     cursor.close()
     conn.close()
 
@@ -411,6 +510,8 @@ if __name__ == "__main__":
     duckdb_file = Path("stardict.ddb")
     if not duckdb_file.exists():
         convert_csv_to_duckdb(csv_file, duckdb_file)
+        # generate_splitedtranslation_column(duckdb_file, buffer_size=1_000)  # 太慢了
+        logger.info(f"DuckDB 文件已生成：{duckdb_file}")
 
     txt_file = Path("stardict.txt")
     if txt_file.exists():
