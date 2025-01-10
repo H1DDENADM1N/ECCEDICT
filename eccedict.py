@@ -1,5 +1,6 @@
 # pip install beautifulsoup4 loguru duckdb
 # writemdict -> https://github.com/skywind3000/writemdict
+# 翻译需要 pip install openai  或  pip install zhipuai
 # ======================================================================
 #
 # eccedict.py -
@@ -24,6 +25,9 @@ POS_PATTERN = re.compile(
 # 定义正则表达式匹配中文字符
 CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 
+# 用于翻译的 API Key 和 URL
+from Secret import Key, Url
+
 
 def convert_csv_to_duckdb(csv_file: Path, duckdb_file: Path):
     """
@@ -40,6 +44,147 @@ def convert_csv_to_duckdb(csv_file: Path, duckdb_file: Path):
     # 读取CSV文件并导入到DuckDB表中
     conn.execute(f"CREATE TABLE stardict AS SELECT * FROM read_csv_auto('{csv_file}')")
     conn.close()
+
+
+def complete_translation(duckdb_file: Path):
+    """
+    补全翻译
+    有 definition 字段但没有 translation 字段
+    调用 AI 进行翻译
+    """
+    if not duckdb_file.exists():
+        logger.error(f"{duckdb_file} 未找到")
+        raise FileNotFoundError(f"{duckdb_file} 未找到")
+
+    # 连接到 DuckDB 数据库
+    conn = duckdb.connect(database=str(duckdb_file), read_only=False)
+    cursor = conn.cursor()
+    query = """SELECT word, definition, translation FROM stardict WHERE definition IS NOT NULL AND translation IS NULL"""
+    cursor.execute(query)
+
+    # 获取所有结果并计算行数
+    results = cursor.fetchall()
+    count = len(results)
+    logger.info(f"需要补全 {count} 条翻译")
+
+    # 调用 deepseek API 进行翻译
+    for word, definition, _ in results:
+        try:
+            # 调用 deepseek API 进行翻译
+            translation = translate_text_via_glm(definition)  # 假设这是一个翻译函数
+            if translation:
+                # 更新数据库中的翻译字段
+                update_query = """UPDATE stardict SET translation = ? WHERE word = ?"""
+                cursor.execute(update_query, (translation, word))
+                conn.commit()
+                logger.info(f"成功补全单词 '{word}' 的翻译: {translation}")
+            else:
+                logger.warning(f"单词 '{word}' 的翻译失败，API 返回空值")
+        except Exception as e:
+            logger.error(f"单词 '{word}' 的翻译失败: {e}")
+
+    # 关闭数据库连接
+    cursor.close()
+    conn.close()
+
+
+def translate_text_via_deepseek(definition: str) -> str:
+    """
+    调用 deepseek API 进行翻译
+    """
+    from openai import OpenAI
+
+    client = OpenAI(api_key=Key.DEEPSEEK, base_url="https://api.deepseek.com")
+
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {
+                "role": "system",
+                "content": '''
+                        You are a professional translation engine, which can translate texts into $to colloquial, professional, elegant and fluent content without explanation with request in the following format:
+                        Translate """     <text>     """ into Chinese
+                        and your answer:
+                        <translated text>
+                        If and only the text consist of a single word, phraseme or phrase, please act as a professional $from-$to dictionary, and list the original form of the word (if any), the corresponding phonetic notation and transcription, the language of the word, the translation of the word,  all senses with parts of speech, bilingual sentence examples (at least 3) and always full etymology you know, if you think there is a spelling mistake, please tell me the most possible correct word otherwise reply in the following format:
+                        <word> (<original form>) <word translated to $to>
+                        [<language>] / <$from phonetic notation>
+                        [<part of speech>]
+                        <meaning in source language> / <meaning translated to $to>
+                        Examples:
+                        <index>. <sentence> (<sentence translation>)
+                        Etymology:
+                        <etymology>
+                    ''',
+            },
+            {
+                "role": "user",
+                "content": f'''
+                        Translate """{definition}""" into Chinese
+                    ''',
+            },
+        ],
+        stream=False,
+    )
+    return "[DeepSeek] " + response.choices[0].message.content
+
+
+def translate_text_via_glm(definition: str) -> str:
+    """
+    调用 智普 GLM-4-Flash API 进行翻译
+    """
+    from zhipuai import ZhipuAI
+
+    client = ZhipuAI(api_key=Key.ZHIPU)
+
+    response = client.chat.completions.create(
+        model="glm-4-flash",
+        messages=[
+            {
+                "role": "system",
+                "content": '''
+                        You are a professional translation engine, which can translate texts into $to colloquial, professional, elegant and fluent content without explanation with request in the following format:
+                        Translate """     <text>     """ into Chinese
+                        and your answer:
+                        <translated text>
+                        If and only the text consist of a single word, phraseme or phrase, please act as a professional $from-$to dictionary, and list the original form of the word (if any), the corresponding phonetic notation and transcription, the language of the word, the translation of the word,  all senses with parts of speech, bilingual sentence examples (at least 3) and always full etymology you know, if you think there is a spelling mistake, please tell me the most possible correct word otherwise reply in the following format:
+                        <word> (<original form>) <word translated to $to>
+                        [<language>] / <$from phonetic notation>
+                        [<part of speech>]
+                        <meaning in source language> / <meaning translated to $to>
+                        Examples:
+                        <index>. <sentence> (<sentence translation>)
+                        Etymology:
+                        <etymology>
+                    ''',
+            },
+            {
+                "role": "user",
+                "content": f'''
+                        Translate """{definition}""" into Chinese
+                    ''',
+            },
+        ],
+        stream=False,
+    )
+    return "[DeepSeek] " + response.choices[0].message.content
+
+
+def translate_text_via_libretranslate(text: str) -> str:
+    import requests
+
+    payload = {
+        "q": text,
+        "source": "en",
+        "target": "zh",
+    }
+    headers = {"Content-Type": "application/json"}
+    response = requests.post(Url.LIBRETRANSLATE, json=payload, headers=headers)
+    if response.status_code == 200:
+        return "[LibreTranslate] " + response.json().get("translatedText")
+    else:
+        logger.error(f"翻译失败: {response.status_code} {response.text}")
+        return ""
 
 
 def convert_duckdb_to_txt(duckdb_file: Path, txt_file: Path, buffer_size: int = 1000):
@@ -402,29 +547,30 @@ def generate_mdx(txt_file: Path, mdx_file: Path):
 
 
 if __name__ == "__main__":
-    logger.info("开始转换...")
+    # logger.info("开始转换...")
 
     csv_file = Path("stardict.csv")
-    if not csv_file.exists():
-        raise FileNotFoundError(f"{duckdb_file} 未找到")
+    # if not csv_file.exists():
+    #     raise FileNotFoundError(f"{duckdb_file} 未找到")
 
     duckdb_file = Path("stardict.ddb")
     if not duckdb_file.exists():
         convert_csv_to_duckdb(csv_file, duckdb_file)
+    complete_translation(duckdb_file)
 
-    txt_file = Path("stardict.txt")
-    if txt_file.exists():
-        # 删除旧的 TXT 文件
-        txt_file.unlink()
-    convert_duckdb_to_txt(duckdb_file, txt_file, buffer_size=1_000_000)
-    logger.info(f"TXT 文件已生成：{txt_file}")
+    # txt_file = Path("stardict.txt")
+    # if txt_file.exists():
+    #     # 删除旧的 TXT 文件
+    #     txt_file.unlink()
+    # convert_duckdb_to_txt(duckdb_file, txt_file, buffer_size=1_000_000)
+    # logger.info(f"TXT 文件已生成：{txt_file}")
 
-    mdx_file = Path("concise-enhanced.mdx")
-    if mdx_file.exists():
-        # 删除旧的 MDX 文件
-        mdx_file.unlink()
-    generate_mdx(txt_file, mdx_file)
-    logger.info(f"MDX 文件已生成：{mdx_file}")
+    # mdx_file = Path("concise-enhanced.mdx")
+    # if mdx_file.exists():
+    #     # 删除旧的 MDX 文件
+    #     mdx_file.unlink()
+    # generate_mdx(txt_file, mdx_file)
+    # logger.info(f"MDX 文件已生成：{mdx_file}")
 
     # goldendict_exe = Path(r"C:\SSS\GoldenDict-ng\goldendict.exe")
     # if goldendict_exe.exists():
