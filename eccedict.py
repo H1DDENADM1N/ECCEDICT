@@ -5,9 +5,10 @@
 # eccedict.py -
 #
 # Created by H1DDENADM1N on 2025/01/09
-# Last Modified: 2025/01/12 19:52
+# Last Modified: 2025/01/13 11:53
 #
 # ======================================================================
+import json
 import re
 import sys
 from datetime import datetime
@@ -25,6 +26,20 @@ POS_PATTERN = re.compile(
 )
 # 定义正则表达式匹配中文字符
 CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+
+# 定义 Qwerty Learner 项目中使用的 json 字典文件路径
+ZK_JSON = Path(r"qwerty-learner\public\dicts\ZhongKaoHeXin.json")  # 2140
+GK_JSON = Path(r"qwerty-learner\public\dicts\GaoKao_3500.json")  # 3877
+CET4_JSON = Path(r"qwerty-learner\public\dicts\CET4_T.json")  # 2607
+CET6_JSON = Path(r"qwerty-learner\public\dicts\CET6_T.json")  # 2345
+KY2024_JSON = Path(r"qwerty-learner\public\dicts\KaoYan_2024.json")
+KY2025_JSON = Path(r"qwerty-learner\public\dicts\2025KaoYanHongBaoShu.json")  # 7640
+TOEFL_JSON = Path(r"qwerty-learner\public\dicts\TOEFL_3_T.json")  # 4264
+IELTS_JSON = Path(r"qwerty-learner\public\dicts\IELTS_3_T.json")  # 3575
+GRE_JSON = Path(r"qwerty-learner\public\dicts\GRE3000_3_T.json")  # 3036
+
+# 定义自定义排序顺序
+CUSTOM_ORDER = ["zk", "gk", "cet4", "cet6", "ky", "toefl", "ielts", "gre"]
 
 
 def configure_logging(log_dir, rotation="1 week", retention="1 month", level="DEBUG"):
@@ -84,6 +99,148 @@ def convert_csv_to_stardictdb(csv_file: Path, stardictdb_file: Path):
     conn.close()
 
 
+def build_tag_ddb(json_file: Path, tag_str: str, tagdb_file: Path) -> int:
+    """
+    从 json 文件 "name" 中取单词，构建 words 表（包含 stardict.ddb 同格式 word 列 和 tag 列）
+    返回添加了几个tag的计数
+    """
+    if not json_file.exists():
+        logger.error(f"{json_file} 未找到")
+        raise FileNotFoundError(f"{json_file} 未找到")
+
+    # 连接到 tag.ddb 数据库
+    conn = duckdb.connect(database=str(tagdb_file), read_only=False)
+    cursor = conn.cursor()
+
+    # 创建表（如果不存在）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS words (
+            word VARCHAR PRIMARY KEY,
+            tag VARCHAR
+        )
+    """)
+
+    # 统计添加的 tag 数量
+    added_tags_count = 0
+
+    # 从 json_file 取单词
+    try:
+        with json_file.open("r", encoding="utf-8") as f:
+            words_data = json.load(f)
+            logger.info(f"开始处理文件: {json_file}")
+
+            for word_entry in words_data:
+                word = word_entry["name"]
+                # 检查单词是否已存在
+                cursor.execute("SELECT tag FROM words WHERE word = ?", (word,))
+                result = cursor.fetchone()
+                if result:
+                    # 如果单词已存在，更新 tag
+                    existing_tags = result[0]
+                    if existing_tags:
+                        tags_list = existing_tags.split(" ")
+                        if tag_str not in tags_list:  # 去重
+                            tags_list.append(tag_str)
+                            new_tag = " ".join(tags_list)  # 用空格分隔
+                            cursor.execute(
+                                "UPDATE words SET tag = ? WHERE word = ?",
+                                (new_tag, word),
+                            )
+                            added_tags_count += 1
+                            # logger.debug(f"单词 '{word}' 已存在，追加 tag: {tag_str}")
+                    else:
+                        cursor.execute(
+                            "UPDATE words SET tag = ? WHERE word = ?", (tag_str, word)
+                        )
+                        added_tags_count += 1
+                        # logger.debug(f"单词 '{word}' 已存在，添加新 tag: {tag_str}")
+                else:
+                    # 如果单词不存在，插入新行
+                    cursor.execute(
+                        "INSERT INTO words (word, tag) VALUES (?, ?)", (word, tag_str)
+                    )
+                    added_tags_count += 1
+                    # logger.debug(f"单词 '{word}' 不存在，插入新行并添加 tag: {tag_str}")
+                conn.commit()
+    except Exception as e:
+        logger.error(f"从 {json_file} 取单词时发生错误：{e}")
+    finally:
+        conn.close()
+        logger.info(
+            f"文件 {json_file} 处理完成，共添加 {added_tags_count} 个 {tag_str} tag"
+        )
+        return added_tags_count
+
+
+def update_tag_from_tagdb_to_stardictdb(tagdb_file: Path, stardictdb_file: Path):
+    """
+    从 tag.ddb 文件中读取 tag 列数据，并更新到 stardict.ddb 文件中的 tag 列
+    """
+    global CUSTOM_ORDER
+
+    if not stardictdb_file.exists():
+        logger.error(f"{stardictdb_file} 未找到")
+        raise FileNotFoundError(f"{stardictdb_file} 未找到")
+    if not tagdb_file.exists():
+        logger.error(f"{tagdb_file} 未找到")
+        raise FileNotFoundError(f"{tagdb_file} 未找到")
+
+    # 连接到 stardict.ddb 数据库
+    conn = duckdb.connect(database=str(stardictdb_file), read_only=False)
+    cursor = conn.cursor()
+    # 连接到 tag.ddb 数据库
+    tag_conn = duckdb.connect(database=str(tagdb_file), read_only=True)
+    tag_cursor = tag_conn.cursor()
+
+    try:
+        # 从 tag.ddb 中获取所有单词及其对应的 tag
+        tag_cursor.execute("SELECT word, tag FROM words")
+        tag_rows = tag_cursor.fetchall()
+
+        # 遍历每个单词，检查 stardict.ddb 中是否存在该单词
+        for tag_row in tag_rows:
+            (word, new_tag) = tag_row
+            if new_tag:  # 只处理有 tag 的单词
+                cursor.execute("SELECT tag FROM stardict WHERE word = ?", (word,))
+                result = cursor.fetchone()
+                if result:
+                    # 如果 stardict.ddb 中存在该单词，合并并更新 tag
+                    existing_tag = result[0]
+                    # 检查 existing_tag 是否为 None，如果是则替换为空字符串
+                    existing_tag = existing_tag if existing_tag is not None else ""
+                    # 检查 new_tag 是否为 None，如果是则替换为空字符串
+                    new_tag = new_tag if new_tag is not None else ""
+                    # 合并并排序
+                    mixed_tag_set: set = set(existing_tag.split(" ")) | set(
+                        new_tag.split(" ")
+                    )
+                    sorted_tag_list = sorted(
+                        mixed_tag_set,
+                        key=lambda x: CUSTOM_ORDER.index(x)
+                        if x in CUSTOM_ORDER
+                        else len(CUSTOM_ORDER),
+                    )
+                    mixed_tag = " ".join(sorted_tag_list)
+                    cursor.execute(
+                        "UPDATE stardict SET tag = ? WHERE word = ?", (mixed_tag, word)
+                    )
+                    logger.debug(
+                        f"更新单词 {word} 的 tag: {existing_tag} -> {mixed_tag}"
+                    )
+
+        # 提交事务
+        conn.commit()
+
+    except Exception as e:
+        logger.error(f"更新 tag 时发生错误: {e}")
+    finally:
+        # 关闭连接
+        cursor.close()
+        conn.close()
+        tag_cursor.close()
+        tag_conn.close()
+
+
 def update_phonetics_from_phoneticsdb_to_stardictdb(
     phoneticsdb_file: Path, stardictdb_file: Path
 ):
@@ -103,51 +260,37 @@ def update_phonetics_from_phoneticsdb_to_stardictdb(
     # 连接到 phonetics.ddb 数据库
     phonetics_conn = duckdb.connect(database=str(phoneticsdb_file), read_only=True)
     phonetics_cursor = phonetics_conn.cursor()
-    # 从 stardict.ddb 拿 word 去 phonetics.ddb 取音标
+
     try:
-        # 从 stardict.ddb 中获取所有单词
-        cursor.execute("SELECT word, phonetic FROM stardict")
-        rows = cursor.fetchall()
+        # 从 phonetics.ddb 中获取所有单词及其对应的音标
+        phonetics_cursor.execute("SELECT word, phon_uk, phon_us FROM words")
+        phonetics_rows = phonetics_cursor.fetchall()
 
-        # 遍历每个单词，从 phonetics.ddb 中获取音标并更新到 stardict.ddb
-        for row in rows:
-            (word, phonetic) = row
-            phonetics_cursor.execute(
-                """
-                SELECT phon_uk, phon_us
-                FROM words
-                WHERE word = ?
-            """,
-                (word,),
-            )
-            result = phonetics_cursor.fetchone()
-
-            if result:
-                (phon_uk, phon_us) = result
-                # 更新 stardict.ddb 中的 phonetic 列
-                if phon_uk == phon_us:
-                    new_phonetic = phon_uk.strip("/")
-                else:
-                    new_phonetic = f"英 {phon_uk.strip('/')} 美 {phon_us.strip('/')}"
-                cursor.execute(
-                    """
-                    UPDATE stardict
-                    SET phonetic = ?
-                    WHERE word = ?
-                """,
-                    (new_phonetic, word),
-                )
-                logger.debug(f"更新单词 {word} 的音标: {new_phonetic}")
-            else:
-                pass  # 跳过没有找到音标的单词
+        # 遍历每个单词，检查 stardict.ddb 中是否存在该单词
+        for phonetics_row in phonetics_rows:
+            (word, phon_uk, phon_us) = phonetics_row
+            if phon_uk or phon_us:  # 只处理有音标的单词
+                cursor.execute("SELECT phonetic FROM stardict WHERE word = ?", (word,))
+                result = cursor.fetchone()
+                if result:
+                    # 如果 stardict.ddb 中存在该单词，更新音标
+                    if phon_uk == phon_us:
+                        new_phonetic = phon_uk.strip("/")
+                    else:
+                        new_phonetic = (
+                            f"英 {phon_uk.strip('/')} 美 {phon_us.strip('/')}"
+                        )
+                    cursor.execute(
+                        "UPDATE stardict SET phonetic = ? WHERE word = ?",
+                        (new_phonetic, word),
+                    )
+                    logger.debug(f"更新单词 {word} 的音标: {new_phonetic}")
 
         # 提交事务
         conn.commit()
 
     except Exception as e:
         logger.error(f"更新音标时发生错误: {e}")
-        if conn.in_transaction:  # 检查是否有活动的事务
-            conn.rollback()  # 回滚事务
     finally:
         # 关闭连接
         cursor.close()
@@ -700,14 +843,14 @@ def generate_mdx(txt_file: Path, mdx_file: Path):
     writer = MDictWriter(
         dictionary,
         title="英汉汉英字典",
-        description="<font size=5 color=red>简明英汉汉英字典增强版 - CSS ：20250112<br>"
+        description="<font size=5 color=red>简明英汉汉英字典增强版 - CSS ：20250113<br>"
         "(数据：http://github.com/skywind3000/ECDICT)<br>"
         "1. 开源英汉字典：MIT / CC 双协议<br>"
         "2. 标注牛津三千关键词：音标后 K字符<br>"
         "3. 柯林斯星级词汇标注：音标后 1-5的数字<br>"
         "4. 标注 COCA/BNC 的词频顺序<br>"
         "5. 标注考试大纲信息：中高研四六托雅 等<br>"
-        "6. 增加汉英反查<br>"
+        "6. 增加汉英反查、增加英美音标、更新考试大纲信息<br>"
         "</font>",
     )
 
@@ -752,7 +895,7 @@ def calculate_time_interval(log1, log2):
 
 
 if __name__ == "__main__":
-    # 配置日志  完整流程耗时  ⏱️2h3m26s
+    # 配置日志  完整流程耗时  ⏱️2h
     configure_logging("logs", level="DEBUG")
 
     # 记录开始时间
@@ -768,6 +911,7 @@ if __name__ == "__main__":
     # 输出文件
     output_dir = Path("output")
     stardictdb_file = Path() / output_dir / "stardict.ddb"
+    tagdb_file = Path() / "output" / "tag.ddb"
     phoneticsdb_file = Path() / output_dir / "phonetics.ddb"
     txt_file = Path() / output_dir / "stardict.txt"
     mdx_file = Path("concise-enhanced.mdx")
@@ -789,6 +933,9 @@ if __name__ == "__main__":
     if stardictdb_file.exists():
         # 删除旧的词典数据库文件
         stardictdb_file.unlink()
+    if tagdb_file.exists():
+        # 删除旧的标签数据库文件
+        tagdb_file.unlink()
     if phoneticsdb_file.exists():
         # 删除旧的音标数据库文件
         phoneticsdb_file.unlink()
@@ -817,57 +964,87 @@ if __name__ == "__main__":
     time_interval = calculate_time_interval(step0_end_time, step1_end_time)
     logger.success(f"步骤1完成，耗时: {time_interval}")
 
-    # 2️⃣ 🔖 生成 phonetics.ddb  ⏱️14m50s
-    logger.info("生成 phonetics.ddb 文件...")
-    build_phonetics_ddb(oald_txt, phoneticsdb_file)
-    logger.info(f"phonetics.ddb 文件已生成：{phoneticsdb_file}")
+    # 2️⃣ 🔖 生成 tag.ddb  ⏱️1m17s
+    logger.info("生成 tag.ddb 文件...")
+    zk_tag_count = build_tag_ddb(ZK_JSON, "zk", tagdb_file)
+    gk_tag_count = build_tag_ddb(GK_JSON, "gk", tagdb_file)
+    cet4_tag_count = build_tag_ddb(CET4_JSON, "cet4", tagdb_file)
+    cet6_tag_count = build_tag_ddb(CET6_JSON, "cet6", tagdb_file)
+    ky2024_tag_count = build_tag_ddb(KY2024_JSON, "ky", tagdb_file)
+    ky2025_tag_count = build_tag_ddb(KY2025_JSON, "ky", tagdb_file)
+    toefl_tag_count = build_tag_ddb(TOEFL_JSON, "toefl", tagdb_file)
+    ielts_tag_count = build_tag_ddb(IELTS_JSON, "ielts", tagdb_file)
+    gre_tag_count = build_tag_ddb(GRE_JSON, "gre", tagdb_file)
+    logger.info(
+        f"tag.ddb 文件已生成：{tagdb_file}\nzk: {zk_tag_count}\ngk: {gk_tag_count}\nky: {ky2024_tag_count + ky2025_tag_count}\ncet4: {cet4_tag_count}\ncet6: {cet6_tag_count}\ntoefl: {toefl_tag_count}\nielts: {ielts_tag_count}\ngre: {gre_tag_count}"
+    )
 
     # 记录步骤2结束时间
     step2_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     time_interval = calculate_time_interval(step1_end_time, step2_end_time)
     logger.success(f"步骤2完成，耗时: {time_interval}")
 
-    # 3️⃣ 🆕 更新 stardict.ddb 音标信息  ⏱️1h13m20s
-    logger.info("更新音标信息...")
-    update_phonetics_from_phoneticsdb_to_stardictdb(phoneticsdb_file, stardictdb_file)
-    logger.info(f"更新音标信息完成：{stardictdb_file}")
+    # 3️⃣ 🆕 更新 stardict.ddb 标签信息  ⏱️4m33s  更新了12365条tag
+    logger.info("更新标签信息...")
+    update_tag_from_tagdb_to_stardictdb(tagdb_file, stardictdb_file)
+    logger.info(f"更新标签信息完成：{stardictdb_file}")
 
     # 记录步骤3结束时间
     step3_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     time_interval = calculate_time_interval(step2_end_time, step3_end_time)
     logger.success(f"步骤3完成，耗时: {time_interval}")
 
-    # 4️⃣ 📄 生成 stardict.txt  ⏱️26m25s
-    logger.info("生成 stardict.txt 文件...")
-    convert_stardictdb_to_txt(stardictdb_file, txt_file, buffer_size=1_000_000)
-    logger.info(f"stardict.txt 文件已生成：{txt_file}")
+    # 4️⃣ 🔖 生成 phonetics.ddb  ⏱️14m28s
+    logger.info("生成 phonetics.ddb 文件...")
+    build_phonetics_ddb(oald_txt, phoneticsdb_file)
+    logger.info(f"phonetics.ddb 文件已生成：{phoneticsdb_file}")
 
     # 记录步骤4结束时间
     step4_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     time_interval = calculate_time_interval(step3_end_time, step4_end_time)
     logger.success(f"步骤4完成，耗时: {time_interval}")
 
-    # 5️⃣ 📦 生成 concise-enhanced.mdx  ⏱️8m49s
-    logger.info("生成 concise-enhanced.mdx 文件...")
-    generate_mdx(txt_file, mdx_file)
-    logger.info(f"concise-enhanced.mdx 文件已生成：{mdx_file}")
+    # 5️⃣ 🆕 更新 stardict.ddb 音标信息  ⏱️1h13m20s  更新了160435条音标
+    logger.info("更新音标信息...")
+    update_phonetics_from_phoneticsdb_to_stardictdb(phoneticsdb_file, stardictdb_file)
+    logger.info(f"更新音标信息完成：{stardictdb_file}")
 
     # 记录步骤5结束时间
     step5_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     time_interval = calculate_time_interval(step4_end_time, step5_end_time)
     logger.success(f"步骤5完成，耗时: {time_interval}")
 
-    # 6️⃣ 🔍 打开 GoldenDict，自动重建索引  ⏱️1s
+    # 6️⃣ 📄 生成 stardict.txt  ⏱️26m25s
+    logger.info("生成 stardict.txt 文件...")
+    convert_stardictdb_to_txt(stardictdb_file, txt_file, buffer_size=1_000_000)
+    logger.info(f"stardict.txt 文件已生成：{txt_file}")
+
+    # 记录步骤6结束时间
+    step6_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    time_interval = calculate_time_interval(step5_end_time, step6_end_time)
+    logger.success(f"步骤6完成，耗时: {time_interval}")
+
+    # 7️⃣ 📦 生成 concise-enhanced.mdx  ⏱️8m49s
+    logger.info("生成 concise-enhanced.mdx 文件...")
+    generate_mdx(txt_file, mdx_file)
+    logger.info(f"concise-enhanced.mdx 文件已生成：{mdx_file}")
+
+    # 记录步骤7结束时间
+    step7_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    time_interval = calculate_time_interval(step6_end_time, step7_end_time)
+    logger.success(f"步骤7完成，耗时: {time_interval}")
+
+    # 8️⃣ 🔍 打开 GoldenDict，自动重建索引  ⏱️1s
     logger.info("打开 GoldenDict...")
     import subprocess
 
     subprocess.Popen(str(goldendict_exe))
     logger.info("GoldenDict 已打开")
 
-    # 记录步骤6结束时间
-    step6_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    time_interval = calculate_time_interval(step5_end_time, step6_end_time)
-    logger.success(f"步骤6完成，耗时: {time_interval}")
+    # 记录步骤8结束时间
+    step8_end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    time_interval = calculate_time_interval(step7_end_time, step8_end_time)
+    logger.success(f"步骤8完成，耗时: {time_interval}")
 
     # 记录总耗时
     total_time_interval = calculate_time_interval(start_time, step6_end_time)
