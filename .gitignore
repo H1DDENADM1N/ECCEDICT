@@ -1,9 +1,12 @@
-__pycache__
+# 忽略 Python 缓存目录
+__pycache__/
 
-/.vscode/*
+# 忽略 VSCode 配置目录
+/.vscode/
+/.history/
 
+# 忽略特定文件
 writemdict
-.history
 stardict.csv
 stardict.ddb
 stardict.txt
@@ -11,7 +14,17 @@ concise-enhanced.mdx
 concise-enhanced.png
 concise-enhanced.css
 Secret.py
+
+# 忽略 output 目录下的所有文件，除了 tag.ddb 和 phonetics.ddb
 /output/*
-/logs/*
-/oald-fork/*
-qwerty-learner/
+!output/tag.ddb
+!output/phonetics.ddb
+
+# 忽略 logs 目录
+/logs/
+
+# 忽略 oald-fork 目录
+/oald-fork/
+
+# 忽略 qwerty-learner 目录
+/qwerty-learner/
